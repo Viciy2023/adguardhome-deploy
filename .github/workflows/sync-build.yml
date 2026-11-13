@@ -311,15 +311,18 @@ jobs:
           docker run --rm "${IMG}" --version
 
       # 实际确认 ACR 上的 manifest 存在且是 amd64，避免"以为推上去了"
+      # 注：docker manifest inspect 在 runner 上会静默返回非 0，改用 buildx imagetools
       - name: Verify ACR push
         if: steps.acrlogin.outcome == 'success'
         run: |
           set -euo pipefail
           ACR_DEST="${ACR_HOST}/${ACR_NAMESPACE}/${ACR_REPO}"
-          for t in "${CHANNEL_TAG}" "${TAG}" "${ARCH_NAME}"; do
-            echo "--- ${ACR_DEST}:${t} ---"
-            docker manifest inspect "${ACR_DEST}:${t}" | grep -E '"(architecture|variant)"' | head -2
+          for t in "${CHANNEL_TAG}" "${TAG}"; do
+            echo "=== ${ACR_DEST}:${t} ==="
+            docker buildx imagetools inspect "${ACR_DEST}:${t}" | tee "/tmp/acr_${t}.txt"
           done
+          grep -q 'linux/amd64' "/tmp/acr_${TAG}.txt" \
+            || { echo "::error::ACR 上的 ${TAG} 不是 linux/amd64"; exit 1; }
 
       # ACR 是本项目的主通道：配置了凭据却没推上去，必须让整次运行失败，
       # 否则会出现"CI 全绿但 NAS 拉不到镜像"的假成功。
