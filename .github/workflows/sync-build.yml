@@ -1,0 +1,325 @@
+name: Sync & Build AdGuard Home (linux/amd64)
+
+# 本仓库不保存上游源码，也不编译 Go / 前端：
+#   1. 每天检查上游 Release 是否有新版本（stable 取 releases/latest，beta 取最新预发布）；
+#   2. 有变化就下载官方发布的可执行文件，用 checksums.txt 校验 sha256；
+#   3. 用仓库内 Dockerfile 重新打包镜像，推送三个 registry：
+#        <ACR_HOST>/<ACR_NAMESPACE>/adguardhome-deploy —— 国内拉取最快，主通道
+#        <DOCKERHUB_USERNAME>/adguardhome-deploy       —— 需配 DOCKERHUB_* secrets
+#        ghcr.io/viciy2023/adguardhome-deploy          —— 备用，只需 GITHUB_TOKEN
+#
+# 任一口令通道凭据缺失或登录失败，只跳过该通道，不影响其他通道。
+# 上游 tag + BUILD_REV + 通道状态 + 架构 组成构建指纹写入 last-build.txt，无变化时跳过构建。
+
+on:
+  schedule:
+    # 每天 UTC 18:00 = 北京 02:00
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "上游版本未变化也强制重建（首次启用、补推某个 registry 时用）"
+        type: boolean
+        default: false
+      channel:
+        description: "发布通道（stable=正式版，beta=预发布版）"
+        type: choice
+        options:
+          - stable
+          - beta
+        default: stable
+
+concurrency:
+  group: sync-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: AdguardTeam/AdGuardHome
+  IMAGE_NAME: ghcr.io/viciy2023/adguardhome-deploy
+  # 完整镜像名 <DOCKERHUB_USERNAME>/<DOCKERHUB_REPO>
+  DOCKERHUB_REPO: adguardhome-deploy
+  # 阿里云 ACR 个人版：host 与命名空间放在仓库 Secrets 里，不要写进公开仓库
+  ACR_REPO: adguardhome-deploy
+  # 只发 fnOS 需要的单架构；要加 arm64 见 README「扩展到多架构」
+  PLATFORM: linux/amd64
+  ARCH_NAME: amd64
+  # 改了构建策略（基镜像、标签规则、缓存方式）就 +1，强制重建一次
+  BUILD_REV: v1
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      channel_tag: ${{ steps.resolve.outputs.channel_tag }}
+      hub: ${{ steps.compare.outputs.hub }}
+      acr: ${{ steps.compare.outputs.acr }}
+    steps:
+      - name: Checkout deploy repo
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream release tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          CHANNEL="${CHANNEL:-stable}"
+
+          if [ "${CHANNEL}" = "beta" ]; then
+            TAG=$(gh api "repos/${UPSTREAM_REPO}/releases?per_page=30" \
+              --jq '[.[] | select(.prerelease == true and .draft == false)][0].tag_name')
+            CHANNEL_TAG=beta
+          else
+            TAG=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name')
+            CHANNEL_TAG=latest
+          fi
+
+          if [ -z "${TAG}" ] || [ "${TAG}" = "null" ]; then
+            echo "::error::无法解析上游 ${CHANNEL} 通道的版本 tag"
+            exit 1
+          fi
+
+          echo "上游版本: ${TAG}（通道标签 ${CHANNEL_TAG}）"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "channel_tag=${CHANNEL_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Compare fingerprint with last build
+        id: compare
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          ALI_USER: ${{ secrets.ALIYUN_USERNAME }}
+          ALI_PASS: ${{ secrets.ALIYUN_PASSWORD }}
+          ALI_HOST: ${{ secrets.ALIYUN_REGISTRY }}
+          ALI_NS: ${{ secrets.ALIYUN_NAMESPACE }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          CHANNEL_TAG: ${{ steps.resolve.outputs.channel_tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${DH_USER}" ] && [ -n "${DH_TOKEN}" ]; then
+            HUB=hub
+            echo "Docker Hub 凭据已配置，本次会尝试推送。"
+          else
+            HUB=nohub
+            echo "未配置 Docker Hub 凭据，跳过 Docker Hub。"
+          fi
+
+          if [ -n "${ALI_USER}" ] && [ -n "${ALI_PASS}" ] && [ -n "${ALI_HOST}" ] && [ -n "${ALI_NS}" ]; then
+            ACR=acr
+            echo "阿里云 ACR 凭据已配置，本次会尝试推送。"
+          else
+            ACR=noacr
+            echo "未配置完整 ACR 凭据（USERNAME/PASSWORD/REGISTRY/NAMESPACE），跳过 ACR。"
+          fi
+
+          LAST_LINE=$(tr -d '[:space:]' < last-build.txt 2>/dev/null || true)
+          WANT_FP="${TAG}${BUILD_REV}${HUB}${ACR}${ARCH_NAME}${CHANNEL_TAG}"
+          echo "want_fp=${WANT_FP}"
+          echo "last_fp=${LAST_LINE:-<空>}"
+
+          if [ "${WANT_FP}" = "${LAST_LINE}" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "上游未变化，跳过构建。"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "检测到变化，开始构建。"
+          fi
+
+      # 上游发版间隔可能超过 60 天，GitHub 会停用定时工作流；无变化时每 5 天提交一次心跳保活。
+      - name: Heartbeat (keep scheduled workflow alive)
+        if: steps.compare.outputs.changed == 'false'
+        run: |
+          set -euo pipefail
+          TODAY=$(date -u +%Y-%m-%d)
+          LAST=$(head -n1 last-check.txt 2>/dev/null || true)
+
+          if [ -n "${LAST}" ] && [ "$(( ( $(date -u +%s) - $(date -u -d "${LAST}" +%s) ) / 86400 ))" -lt 5 ]; then
+            echo "上次心跳 ${LAST}，未满 5 天，跳过。"
+            exit 0
+          fi
+
+          echo "${TODAY}" > last-check.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last-check.txt
+          if git diff --staged --quiet; then
+            echo "心跳未变化，无需提交。"
+            exit 0
+          fi
+          git commit -m "chore: 心跳 ${TODAY}（上游无新版本）"
+          git pull --rebase origin "${{ github.ref_name }}"
+          git push
+
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    env:
+      ACR_HOST: ${{ secrets.ALIYUN_REGISTRY }}
+      ACR_NAMESPACE: ${{ secrets.ALIYUN_NAMESPACE }}
+      TAG: ${{ needs.check.outputs.tag }}
+      CHANNEL_TAG: ${{ needs.check.outputs.channel_tag }}
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout deploy repo
+        uses: actions/checkout@v4
+
+      - name: Fetch and verify upstream release binary
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/${UPSTREAM_REPO}/releases/download/${TAG}"
+
+          curl -fsSL --retry 3 -o checksums.txt "${BASE}/checksums.txt"
+          curl -fsSL --retry 3 -o agh.tar.gz "${BASE}/AdGuardHome_linux_${ARCH_NAME}.tar.gz"
+
+          # checksums.txt 里路径带 ./ 前缀，去掉后再校验
+          grep "AdGuardHome_linux_${ARCH_NAME}.tar.gz" checksums.txt \
+            | sed 's#\./##' \
+            | sha256sum -c -
+
+          tar -xzf agh.tar.gz
+          mkdir -p ctx
+          cp -v AdGuardHome/AdGuardHome ctx/AdGuardHome
+
+          echo "二进制 sha256: $(sha256sum ctx/AdGuardHome | cut -d' ' -f1)"
+          ./ctx/AdGuardHome --version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: needs.check.outputs.hub == 'hub'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 凭据错误时只跳过 ACR，不能拖垮 Docker Hub / GHCR 的推送
+      - name: Diagnose ACR credentials (no secret values printed)
+        if: needs.check.outputs.acr == 'acr'
+        env:
+          ALI_U: ${{ secrets.ALIYUN_USERNAME }}
+          ALI_P: ${{ secrets.ALIYUN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "ALIYUN_USERNAME 长度: ${#ALI_U}"
+          echo "ALIYUN_PASSWORD 长度: ${#ALI_P}"
+          echo "ACR: ${ACR_HOST} / ${ACR_NAMESPACE} / ${ACR_REPO}"
+
+          SCOPE="repository:${ACR_NAMESPACE}/${ACR_REPO}:pull,push"
+          CHALLENGE=$(curl -s -D - -o /dev/null "https://${ACR_HOST}/v2/" \
+            | grep -i '^www-authenticate' | tr -d '\r' || true)
+          REALM=$(printf '%s' "${CHALLENGE}" | sed -n 's/.*realm="\([^"]*\)".*/\1/p')
+          SERVICE=$(printf '%s' "${CHALLENGE}" | sed -n 's/.*service="\([^"]*\)".*/\1/p')
+          echo "token 端点: ${REALM:-<未解析到>}"
+
+          if [ -n "${REALM}" ]; then
+            CODE=$(curl -s -o /tmp/acr_auth.json -w '%{http_code}' -u "${ALI_U}:${ALI_P}" \
+              "${REALM}?service=${SERVICE}&scope=${SCOPE}")
+            echo "token 端点 HTTP: ${CODE}"
+            if grep -q '"token"' /tmp/acr_auth.json 2>/dev/null; then
+              echo "结论: 凭据有效（若有问题只会出现在 docker login 环节）"
+            else
+              echo "结论: 凭据被拒，响应如下（不含密钥）："
+              head -c 300 /tmp/acr_auth.json
+              echo
+            fi
+          fi
+
+      - name: Log in to Aliyun ACR
+        id: acrlogin
+        if: needs.check.outputs.acr == 'acr'
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ALIYUN_REGISTRY }}
+          username: ${{ secrets.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+
+      - name: Assemble push targets
+        id: tags
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+          TAGS="${IMAGE_NAME}:${CHANNEL_TAG},${IMAGE_NAME}:${TAG},${IMAGE_NAME}:${ARCH_NAME}"
+
+          if [ "${{ needs.check.outputs.hub }}" = "hub" ]; then
+            DEST="docker.io/${DH_USER}/${DOCKERHUB_REPO}"
+            TAGS="${TAGS},${DEST}:${CHANNEL_TAG},${DEST}:${TAG},${DEST}:${ARCH_NAME}"
+          fi
+
+          if [ "${{ steps.acrlogin.outcome }}" = "success" ]; then
+            ACR_DEST="${ACR_HOST}/${ACR_NAMESPACE}/${ACR_REPO}"
+            TAGS="${TAGS},${ACR_DEST}:${CHANNEL_TAG},${ACR_DEST}:${TAG},${ACR_DEST}:${ARCH_NAME}"
+          elif [ "${{ needs.check.outputs.acr }}" = "acr" ]; then
+            echo "::warning::阿里云 ACR 登录失败，本次跳过 ACR 推送，仅推送 GHCR / Docker Hub。"
+          fi
+
+          echo "value=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "推送目标: ${TAGS}"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./ctx
+          file: ./Dockerfile
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          # 关掉 attestation，否则 manifest 里多出 unknown 架构，老版本 Docker 拉取可能报 no matching manifest
+          provenance: false
+          tags: ${{ steps.tags.outputs.value }}
+          build-args: |
+            VERSION=${{ needs.check.outputs.tag }}
+            VCS_REF=${{ needs.check.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify pushed image
+        run: |
+          set -euo pipefail
+          IMG="${IMAGE_NAME}:${TAG}"
+          docker pull -q "${IMG}"
+
+          WANT=$(sha256sum ctx/AdGuardHome | cut -d' ' -f1)
+          GOT=$(docker run --rm --entrypoint sha256sum "${IMG}" /opt/adguardhome/AdGuardHome | cut -d' ' -f1)
+          echo "上游二进制 ${WANT}"
+          echo "镜像内二进制 ${GOT}"
+          if [ "${WANT}" != "${GOT}" ]; then
+            echo "::error::镜像内二进制与上游 release 不一致"
+            exit 1
+          fi
+
+          docker run --rm "${IMG}" --version
+
+      - name: Record built fingerprint
+        run: |
+          echo "${TAG}${BUILD_REV}${{ needs.check.outputs.hub }}${{ needs.check.outputs.acr }}${ARCH_NAME}${CHANNEL_TAG}" > last-build.txt
+
+      - name: Commit fingerprint
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last-build.txt
+          if git diff --staged --quiet; then
+            echo "指纹未变化，无需提交。"
+            exit 0
+          fi
+          git commit -m "build: 上游 ${{ needs.check.outputs.tag }} 构建完成（${ARCH_NAME}）"
+          git pull --rebase origin "${{ github.ref_name }}"
+          git push
