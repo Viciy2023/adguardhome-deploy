@@ -125,6 +125,27 @@ docker compose pull && docker compose up -d
 各架构分别 build+push 后再用 `docker buildx imagetools create` 合成多架构 manifest，最后推 `latest`。
 注意 `provenance: false` 必须保留。
 
+## 修改管理员密码
+
+AdGuard Home（v0.107 旧 UI 与 v1.0 新 UI **都是**）没有"修改密码"界面：语言包里只有
+`password_login_error` / `install_auth_password` / `forgot_password`，接口里也没有 `/control/users`。
+而且 `users: []` 不是"进入安装向导"，而是**关闭鉴权**（`internal/home/auth.go` 的 `isUserless`）。
+
+真正的 first-run 只由**配置文件是否存在**决定（`internal/home/web.go` 的 `conf.firstRun`），所以改密码要这样：
+
+```bash
+cd /vol1/1000/Docker/adguardhome
+sudo docker compose stop
+cp -p conf/AdGuardHome.yaml conf/AdGuardHome.yaml.full-settings   # 留作之后合并
+mv conf/AdGuardHome.yaml conf/AdGuardHome.yaml.wizard-off
+sudo docker compose start
+# 浏览器打开 :3001 走完向导：设新用户名/密码，Web 端口 3001、DNS 端口 53
+```
+
+⚠️ 向导**只设端口、不设上游 DNS**，走完必须把 `upstream_dns` / `bootstrap_dns` 改成
+`223.5.5.5`、`119.29.29.29`（默认是 Quad9，国内不通），否则解析会全挂。
+过滤规则（AdGuard DNS filter）向导会自动启用，不用手动加。
+
 ## 已知限制
 
 | 限制 | 说明 |
