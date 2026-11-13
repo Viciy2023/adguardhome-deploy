@@ -178,14 +178,15 @@ jobs:
           BASE="https://github.com/${UPSTREAM_REPO}/releases/download/${TAG}"
 
           curl -fsSL --retry 3 -o checksums.txt "${BASE}/checksums.txt"
-          curl -fsSL --retry 3 -o agh.tar.gz "${BASE}/AdGuardHome_linux_${ARCH_NAME}.tar.gz"
+          # 文件名必须与 checksums.txt 中一致（带 ./ 前缀的那行去掉前缀后正好对得上）
+          curl -fsSL --retry 3 -o "AdGuardHome_linux_${ARCH_NAME}.tar.gz" \
+            "${BASE}/AdGuardHome_linux_${ARCH_NAME}.tar.gz"
 
-          # checksums.txt 里路径带 ./ 前缀，去掉后再校验
           grep "AdGuardHome_linux_${ARCH_NAME}.tar.gz" checksums.txt \
             | sed 's#\./##' \
             | sha256sum -c -
 
-          tar -xzf agh.tar.gz
+          tar -xzf "AdGuardHome_linux_${ARCH_NAME}.tar.gz"
           mkdir -p ctx
           cp -v AdGuardHome/AdGuardHome ctx/AdGuardHome
 
