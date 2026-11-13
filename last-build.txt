@@ -1,1 +1,1 @@
-v0.107.80v1amd64latest
+v0.107.80v1nohubnoacramd64latest
