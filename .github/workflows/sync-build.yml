@@ -3,13 +3,12 @@ name: Sync & Build AdGuard Home (linux/amd64)
 # 本仓库不保存上游源码，也不编译 Go / 前端：
 #   1. 每天检查上游 Release 是否有新版本（stable 取 releases/latest，beta 取最新预发布）；
 #   2. 有变化就下载官方发布的可执行文件，用 checksums.txt 校验 sha256；
-#   3. 用仓库内 Dockerfile 重新打包镜像，推送三个 registry：
-#        <ACR_HOST>/<ACR_NAMESPACE>/adguardhome-deploy —— 国内拉取最快，主通道
-#        <DOCKERHUB_USERNAME>/adguardhome-deploy       —— 需配 DOCKERHUB_* secrets
-#        ghcr.io/viciy2023/adguardhome-deploy          —— 备用，只需 GITHUB_TOKEN
+#   3. 用仓库内 Dockerfile 重新打包镜像，推到阿里云 ACR：
+#        <ACR_HOST>/<ACR_NAMESPACE>/adguardhome-deploy  —— 唯一主通道（国内可直连拉取）
+#        可选：<DOCKERHUB_USERNAME>/adguardhome-deploy   —— 配了 DOCKERHUB_* secrets 才推
 #
-# 任一口令通道凭据缺失或登录失败，只跳过该通道，不影响其他通道。
-# 上游 tag + BUILD_REV + 通道状态 + 架构 组成构建指纹写入 last-build.txt，无变化时跳过构建。
+# 只推 ACR：国内直连 Docker Hub / ghcr.io 不作为部署来源，多推通道只会浪费时间。
+# 上游 tag + BUILD_REV + 各通道状态 + 架构 组成构建指纹写入 last-build.txt，无变化时跳过构建。
 
 on:
   schedule:
@@ -18,11 +17,11 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: "上游版本未变化也强制重建（首次启用、补推某个 registry 时用）"
+        description: "上游版本未变化也强制重建（首次启用、补推时用）"
         type: boolean
         default: false
       channel:
-        description: "发布通道（stable=正式版，beta=预发布版）"
+        description: "发布通道（stable=正式版，beta=预发布版/新 UI）"
         type: choice
         options:
           - stable
@@ -35,11 +34,10 @@ concurrency:
 
 env:
   UPSTREAM_REPO: AdguardTeam/AdGuardHome
-  IMAGE_NAME: ghcr.io/viciy2023/adguardhome-deploy
-  # 完整镜像名 <DOCKERHUB_USERNAME>/<DOCKERHUB_REPO>
-  DOCKERHUB_REPO: adguardhome-deploy
   # 阿里云 ACR 个人版：host 与命名空间放在仓库 Secrets 里，不要写进公开仓库
   ACR_REPO: adguardhome-deploy
+  # 可选的 Docker Hub 备用通道，配了 DOCKERHUB_* secrets 才会推
+  DOCKERHUB_REPO: adguardhome-deploy
   # 只发 fnOS 需要的单架构；要加 arm64 见 README「扩展到多架构」
   PLATFORM: linux/amd64
   ARCH_NAME: amd64
@@ -104,19 +102,20 @@ jobs:
 
           if [ -n "${DH_USER}" ] && [ -n "${DH_TOKEN}" ]; then
             HUB=hub
-            echo "Docker Hub 凭据已配置，本次会尝试推送。"
+            echo "Docker Hub 凭据已配置，本次会附带推送。"
           else
             HUB=nohub
-            echo "未配置 Docker Hub 凭据，跳过 Docker Hub。"
+            echo "未配置 Docker Hub 凭据，只推 ACR。"
           fi
           echo "hub=${HUB}" >> "$GITHUB_OUTPUT"
 
           if [ -n "${ALI_USER}" ] && [ -n "${ALI_PASS}" ] && [ -n "${ALI_HOST}" ] && [ -n "${ALI_NS}" ]; then
             ACR=acr
-            echo "阿里云 ACR 凭据已配置，本次会尝试推送。"
+            echo "阿里云 ACR 凭据已配置。"
           else
             ACR=noacr
-            echo "未配置完整 ACR 凭据（USERNAME/PASSWORD/REGISTRY/NAMESPACE），跳过 ACR。"
+            echo "::error::未配置完整 ACR 凭据（ALIYUN_USERNAME/PASSWORD/REGISTRY/NAMESPACE），没有可推送的目标。"
+            exit 1
           fi
           echo "acr=${ACR}" >> "$GITHUB_OUTPUT"
 
@@ -169,7 +168,6 @@ jobs:
       CHANNEL_TAG: ${{ needs.check.outputs.channel_tag }}
     permissions:
       contents: write
-      packages: write
     steps:
       - name: Checkout deploy repo
         uses: actions/checkout@v4
@@ -198,23 +196,19 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
+      # 凭据错误时不能让 job 静默"成功"：这里 continue-on-error 只是为了保留诊断信息，
+      # 后面的 Fail when ACR login failed 会把整次运行标红。
+      - name: Log in to Aliyun ACR
+        id: acrlogin
+        continue-on-error: true
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: ${{ secrets.ALIYUN_REGISTRY }}
+          username: ${{ secrets.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
 
-      - name: Log in to Docker Hub
-        if: needs.check.outputs.hub == 'hub'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      # 凭据错误时只跳过 ACR，不能拖垮 Docker Hub / GHCR 的推送
       - name: Diagnose ACR credentials (no secret values printed)
-        if: needs.check.outputs.acr == 'acr'
+        if: steps.acrlogin.outcome != 'success'
         env:
           ALI_U: ${{ secrets.ALIYUN_USERNAME }}
           ALI_P: ${{ secrets.ALIYUN_PASSWORD }}
@@ -236,7 +230,7 @@ jobs:
               "${REALM}?service=${SERVICE}&scope=${SCOPE}")
             echo "token 端点 HTTP: ${CODE}"
             if grep -q '"token"' /tmp/acr_auth.json 2>/dev/null; then
-              echo "结论: 凭据有效（若有问题只会出现在 docker login 环节）"
+              echo "结论: 凭据有效（问题在 docker login 环节）"
             else
               echo "结论: 凭据被拒，响应如下（不含密钥）："
               head -c 300 /tmp/acr_auth.json
@@ -244,15 +238,18 @@ jobs:
             fi
           fi
 
-      - name: Log in to Aliyun ACR
-        id: acrlogin
-        if: needs.check.outputs.acr == 'acr'
-        continue-on-error: true
+      - name: Fail when ACR login failed
+        if: steps.acrlogin.outcome != 'success'
+        run: |
+          echo "::error::ACR 登录失败，唯一的推送目标不可用。请检查 ALIYUN_USERNAME（必须是 ACR 控制台「访问凭证」里的登录名，不是命名空间）与 ALIYUN_PASSWORD（固定密码，不是阿里云登录密码/AccessKey）。"
+          exit 1
+
+      - name: Log in to Docker Hub (optional)
+        if: needs.check.outputs.hub == 'hub'
         uses: docker/login-action@v3
         with:
-          registry: ${{ secrets.ALIYUN_REGISTRY }}
-          username: ${{ secrets.ALIYUN_USERNAME }}
-          password: ${{ secrets.ALIYUN_PASSWORD }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Assemble push targets
         id: tags
@@ -260,24 +257,20 @@ jobs:
           DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           set -euo pipefail
-          TAGS="${IMAGE_NAME}:${CHANNEL_TAG},${IMAGE_NAME}:${TAG},${IMAGE_NAME}:${ARCH_NAME}"
+          ACR_DEST="${ACR_HOST}/${ACR_NAMESPACE}/${ACR_REPO}"
+          TAGS="${ACR_DEST}:${CHANNEL_TAG},${ACR_DEST}:${TAG},${ACR_DEST}:${ARCH_NAME}"
 
           if [ "${{ needs.check.outputs.hub }}" = "hub" ]; then
             DEST="docker.io/${DH_USER}/${DOCKERHUB_REPO}"
             TAGS="${TAGS},${DEST}:${CHANNEL_TAG},${DEST}:${TAG},${DEST}:${ARCH_NAME}"
           fi
 
-          if [ "${{ steps.acrlogin.outcome }}" = "success" ]; then
-            ACR_DEST="${ACR_HOST}/${ACR_NAMESPACE}/${ACR_REPO}"
-            TAGS="${TAGS},${ACR_DEST}:${CHANNEL_TAG},${ACR_DEST}:${TAG},${ACR_DEST}:${ARCH_NAME}"
-          elif [ "${{ needs.check.outputs.acr }}" = "acr" ]; then
-            echo "::warning::阿里云 ACR 登录失败，本次跳过 ACR 推送，仅推送 GHCR / Docker Hub。"
-          fi
-
           echo "value=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "acr_dest=${ACR_DEST}" >> "$GITHUB_OUTPUT"
           echo "推送目标: ${TAGS}"
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ./ctx
@@ -293,14 +286,24 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Verify pushed image
+      # 端到端校验：从 ACR 把镜像拉回来，架构对、二进制对、能启动。
+      # 注意：manifest 里没有 architecture 字段（架构在 config blob 里），所以直接拉下来比对。
+      - name: Verify ACR image
+        env:
+          ACR_DEST: ${{ steps.tags.outputs.acr_dest }}
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          IMG="${IMAGE_NAME}:${TAG}"
-          docker pull -q "${IMG}"
+          echo "构建产物 digest: ${BUILD_DIGEST}"
+          docker buildx imagetools inspect "${ACR_DEST}:${TAG}"
+
+          docker pull -q "${ACR_DEST}:${TAG}"
+          ARCH=$(docker image inspect "${ACR_DEST}:${TAG}" --format '{{.Architecture}}')
+          echo "ACR 镜像架构: ${ARCH}"
+          [ "${ARCH}" = "amd64" ] || { echo "::error::ACR 镜像架构是 ${ARCH}，期望 amd64"; exit 1; }
 
           WANT=$(sha256sum ctx/AdGuardHome | cut -d' ' -f1)
-          GOT=$(docker run --rm --entrypoint sha256sum "${IMG}" /opt/adguardhome/AdGuardHome | cut -d' ' -f1)
+          GOT=$(docker run --rm --entrypoint sha256sum "${ACR_DEST}:${TAG}" /opt/adguardhome/AdGuardHome | cut -d' ' -f1)
           echo "上游二进制 ${WANT}"
           echo "镜像内二进制 ${GOT}"
           if [ "${WANT}" != "${GOT}" ]; then
@@ -308,37 +311,7 @@ jobs:
             exit 1
           fi
 
-          docker run --rm "${IMG}" --version
-
-      # 实际确认 ACR 上确实有这次构建的产物。
-      # 注：① docker manifest inspect 在 runner 上会静默返回非 0；
-      #     ② 单 manifest 的 JSON 里没有 architecture（架构在 config blob 里），所以不比架构；
-      #     ③ 改为比对 ACR 与 GHCR 的 manifest digest——同一次构建，digest 必须一致。
-      - name: Verify ACR push
-        if: steps.acrlogin.outcome == 'success'
-        run: |
-          set -euo pipefail
-          ACR_DEST="${ACR_HOST}/${ACR_NAMESPACE}/${ACR_REPO}"
-          for t in "${CHANNEL_TAG}" "${TAG}"; do
-            echo "=== ${ACR_DEST}:${t} ==="
-            docker buildx imagetools inspect "${ACR_DEST}:${t}"
-            GHCR_D=$(docker buildx imagetools inspect "${IMAGE_NAME}:${t}" --format '{{.Manifest.Digest}}')
-            ACR_D=$(docker buildx imagetools inspect "${ACR_DEST}:${t}" --format '{{.Manifest.Digest}}')
-            echo "ghcr=${GHCR_D}"
-            echo "acr =${ACR_D}"
-            [ "${GHCR_D}" = "${ACR_D}" ] \
-              || { echo "::error::ACR 与 GHCR 的 ${t} digest 不一致"; exit 1; }
-          done
-          echo "OK: ACR 上的镜像与 GHCR 完全一致"
-
-      # ACR 是本项目的主通道：配置了凭据却没推上去，必须让整次运行失败，
-      # 否则会出现"CI 全绿但 NAS 拉不到镜像"的假成功。
-      # 注意 continue-on-error 只影响 outcome，不影响步骤在 UI 上的 conclusion。
-      - name: Fail when ACR was configured but login failed
-        if: needs.check.outputs.acr == 'acr' && steps.acrlogin.outcome != 'success'
-        run: |
-          echo "::error::ALIYUN_* 凭据已配置，但 ACR 登录失败，主通道未推送。请检查 ALIYUN_USERNAME（必须是 ACR 控制台「访问凭证」里的登录名，不是命名空间）与 ALIYUN_PASSWORD（固定密码，不是阿里云登录密码/AccessKey）。"
-          exit 1
+          docker run --rm "${ACR_DEST}:${TAG}" --version
 
       - name: Record built fingerprint
         run: |

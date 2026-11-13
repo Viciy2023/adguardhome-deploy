@@ -21,9 +21,10 @@ AdGuard Home 不用这样：
 
 | 通道 | 地址 | 说明 |
 | --- | --- | --- |
-| 阿里云 ACR（主通道） | `<ALIYUN_REGISTRY>/<ALIYUN_NAMESPACE>/adguardhome-deploy` | 国内拉取最快 |
-| Docker Hub（可选） | `<DOCKERHUB_USERNAME>/adguardhome-deploy` | 需配 secrets |
-| GHCR（备用） | `ghcr.io/viciy2023/adguardhome-deploy` | 只需 `GITHUB_TOKEN` |
+| 阿里云 ACR（唯一主通道） | `<ALIYUN_REGISTRY>/<ALIYUN_NAMESPACE>/adguardhome-deploy` | 国内直连可拉，部署只认这条 |
+| Docker Hub（可选） | `<DOCKERHUB_USERNAME>/adguardhome-deploy` | 仅配了 `DOCKERHUB_*` secrets 才会推 |
+
+不推 GHCR：国内直连 `ghcr.io` / `registry-1.docker.io` 都不是可靠来源，多推一路只会拉长构建时间。
 
 标签规则（三通道一致）：
 
@@ -47,15 +48,17 @@ AdGuard Home 不用这样：
    可选 Docker Hub：`DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`。
 
    ⚠️ ACR **不会自动建仓库**，必须先在控制台建好命名空间和 `adguardhome-deploy` 仓库，否则推送报 `name unknown`。
-   四个 `ALIYUN_*` 齐备才会推 ACR，缺任何一个自动跳过，不影响 GHCR。
+   四个 `ALIYUN_*` 缺任何一个，工作流直接失败（ACR 是唯一主通道，不允许"静默跳过"）。
 
 2. **Actions** → `Sync & Build AdGuard Home (linux/amd64)` → **Run workflow**，勾 `force`。
 
 3. 确认镜像架构与内容：
 
    ```bash
-   docker manifest inspect <ALIYUN_REGISTRY>/<ALIYUN_NAMESPACE>/adguardhome-deploy:<tag> | grep -i architecture
-   # 期望 "architecture": "amd64"
+   docker buildx imagetools inspect <ALIYUN_REGISTRY>/<ALIYUN_NAMESPACE>/adguardhome-deploy:<tag>
+   docker pull <ALIYUN_REGISTRY>/<ALIYUN_NAMESPACE>/adguardhome-deploy:<tag>
+   docker image inspect <ALIYUN_REGISTRY>/<ALIYUN_NAMESPACE>/adguardhome-deploy:<tag> --format '{{.Architecture}}'
+   # 期望 amd64
    ```
 
 ## 触发方式
@@ -66,7 +69,7 @@ AdGuard Home 不用这样：
   - `channel`：`stable`（默认）或 `beta`（推 `beta` 标签，不进 `latest`）
 
 指纹 = `tag + BUILD_REV + 通道状态 + 架构 + 通道标签`，写入 `last-build.txt`，无变化就跳过构建。
-所以「先只推 GHCR、之后补配 ACR」时，配好 secrets 后会自动再构建一次补推。
+配好/更换 ACR 凭据后指纹会变化，会自动再构建一次并补推，不需要手动勾 `force`。
 
 无上游更新时，工作流每 5 天提交一次 `last-check.txt` 心跳，避免 GitHub「60 天无提交停用定时任务」。
 
@@ -129,5 +132,5 @@ docker compose pull && docker compose up -d
 | 不编译源码 | 二进制来自上游 release，本项目不做安全审计；如需完全自编译，参见上游 `make build-docker`（需 Go 1.27.4 + 两套前端 npm 构建，30–60 分钟） |
 | 只发 stable 会滞后 | 上游 beta（`v1.0.0-b.x`）有新 UI，但默认不进 `latest` |
 | 容器内不自动升级 | 镜像 CMD 带 `--no-check-update`，升级只能 `docker compose pull` |
-| ACR 登录失败不阻塞 | 只 skip ACR，GHCR / Docker Hub 照常推；排查看该步骤 annotation |
+| ACR 登录失败直接失败 | ACR 是唯一主通道，登录失败会把整次运行标红，不会出现"CI 全绿但拉不到镜像" |
 | 基础镜像 `alpine:3.23` | 上游 `docker/build.Dockerfile` 同款；上游升级基镜像时本仓库需手动跟进 |
