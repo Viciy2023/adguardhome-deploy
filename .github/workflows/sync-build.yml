@@ -310,6 +310,17 @@ jobs:
 
           docker run --rm "${IMG}" --version
 
+      # 实际确认 ACR 上的 manifest 存在且是 amd64，避免"以为推上去了"
+      - name: Verify ACR push
+        if: steps.acrlogin.outcome == 'success'
+        run: |
+          set -euo pipefail
+          ACR_DEST="${ACR_HOST}/${ACR_NAMESPACE}/${ACR_REPO}"
+          for t in "${CHANNEL_TAG}" "${TAG}" "${ARCH_NAME}"; do
+            echo "--- ${ACR_DEST}:${t} ---"
+            docker manifest inspect "${ACR_DEST}:${t}" | grep -E '"(architecture|variant)"' | head -2
+          done
+
       - name: Record built fingerprint
         run: |
           echo "${TAG}${BUILD_REV}${{ needs.check.outputs.hub }}${{ needs.check.outputs.acr }}${ARCH_NAME}${CHANNEL_TAG}" > last-build.txt
