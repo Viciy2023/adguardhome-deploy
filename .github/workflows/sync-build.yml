@@ -109,6 +109,7 @@ jobs:
             HUB=nohub
             echo "未配置 Docker Hub 凭据，跳过 Docker Hub。"
           fi
+          echo "hub=${HUB}" >> "$GITHUB_OUTPUT"
 
           if [ -n "${ALI_USER}" ] && [ -n "${ALI_PASS}" ] && [ -n "${ALI_HOST}" ] && [ -n "${ALI_NS}" ]; then
             ACR=acr
@@ -117,6 +118,7 @@ jobs:
             ACR=noacr
             echo "未配置完整 ACR 凭据（USERNAME/PASSWORD/REGISTRY/NAMESPACE），跳过 ACR。"
           fi
+          echo "acr=${ACR}" >> "$GITHUB_OUTPUT"
 
           LAST_LINE=$(tr -d '[:space:]' < last-build.txt 2>/dev/null || true)
           WANT_FP="${TAG}${BUILD_REV}${HUB}${ACR}${ARCH_NAME}${CHANNEL_TAG}"
