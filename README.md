@@ -99,9 +99,10 @@ services:
         max-file: "3"
 ```
 
-拉取前需要登录 ACR（`docker compose` 不走 registry mirror）：
+ACR 仓库若设为**公开**（本次部署用的是公开仓库），拉取不需要登录；设为私有才需要：
 
 ```bash
+# 私有仓库才需要
 docker login <ALIYUN_REGISTRY>
 docker compose pull && docker compose up -d
 ```
