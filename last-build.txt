@@ -1,1 +1,1 @@
-v0.107.80v1nohubnoacramd64latest
+v1.0.0-b.2v1nohubacramd64beta
