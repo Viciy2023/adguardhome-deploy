@@ -321,6 +321,15 @@ jobs:
             docker manifest inspect "${ACR_DEST}:${t}" | grep -E '"(architecture|variant)"' | head -2
           done
 
+      # ACR 是本项目的主通道：配置了凭据却没推上去，必须让整次运行失败，
+      # 否则会出现"CI 全绿但 NAS 拉不到镜像"的假成功。
+      # 注意 continue-on-error 只影响 outcome，不影响步骤在 UI 上的 conclusion。
+      - name: Fail when ACR was configured but login failed
+        if: needs.check.outputs.acr == 'acr' && steps.acrlogin.outcome != 'success'
+        run: |
+          echo "::error::ALIYUN_* 凭据已配置，但 ACR 登录失败，主通道未推送。请检查 ALIYUN_USERNAME（必须是 ACR 控制台「访问凭证」里的登录名，不是命名空间）与 ALIYUN_PASSWORD（固定密码，不是阿里云登录密码/AccessKey）。"
+          exit 1
+
       - name: Record built fingerprint
         run: |
           echo "${TAG}${BUILD_REV}${{ needs.check.outputs.hub }}${{ needs.check.outputs.acr }}${ARCH_NAME}${CHANNEL_TAG}" > last-build.txt
